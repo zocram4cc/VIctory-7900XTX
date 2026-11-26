@@ -4034,32 +4034,43 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
-    /// Our write into title memory after the asking that found it has ended is in the journal: the
-    /// next submission's asking, answered from the journal, reports it. (`wrote` told the journal
-    /// only while an asking stood; with `VICTORY_PORT_JOURNAL=1` it also returned before noting.)
+    /// Our writes into title memory are told to the journal whether or not an asking stands
+    /// (`VICTORY_NOTE_WRITES`), and with renderer port #7 too, where they are noted shared: with
+    /// none standing the notes are in and nothing else is touched; with one standing the number its
+    /// answers carry moves up to the notes' ([`told`]), as it does with the journal alone.
     #[test]
-    fn our_write_between_two_askings_is_copied() {
+    fn our_writes_are_told_with_port_7_whether_or_not_an_asking_stands() {
         const MIB: usize = 1 << 20;
         // SAFETY: a fresh write-watched allocation, freed at the end.
-        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * MIB, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * MIB, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
         assert_ne!(p, 0);
         let a = p.next_multiple_of(MIB);
-        let (start, end) = (a, a + MIB);
-        ask_once(&[(start, end)]);
-        let (asked, _) = writes(start, end, false).expect("watched");
-        ask_once_end();
-        // A Copy step: our bytes go into title memory, and then the journal is told.
-        // SAFETY: a committed page of ours.
-        unsafe { ((a + 3 * PAGE + 8) as *mut u8).write(1) };
-        wrote(a + 3 * PAGE, PAGE);
-        // The next submission's asking: the write is in the journal.
-        ask_once(&[(start, end)]);
-        let (_, after) = writes(start, end, false).expect("watched");
-        ask_once_end();
+        let note = |page: usize| journal().notes.range(page, page + 1).first().map_or(0, |n| n.1);
+        for port in [false, true] {
+            PORT_JOURNAL_IN_TEST.set(port);
+            // Pages of their own in each round.
+            let base = a + if port { 8 * PAGE } else { 0 };
+            let page = |n: usize| (base + n * PAGE) / PAGE;
+            ask_once_end();
+            // None standing: noted anyway.
+            let (before1, before2) = (note(page(1)), note(page(2)));
+            told(&[(base + PAGE + 8, 16)]);
+            assert!(note(page(1)) > before1, "told with none standing, port 7: {port}");
+            wrote(base + 2 * PAGE, PAGE);
+            assert!(note(page(2)) > before2, "wrote with none standing, port 7: {port}");
+            // One standing: the number its answers carry is not older than a note of ours.
+            ask_once(&[(base, base + PAGE), (base + 3 * PAGE, base + 4 * PAGE)]);
+            let (standing, _) = asked(base, base + PAGE).expect("an asking stands");
+            told(&[(base + 3 * PAGE + 8, 16)]);
+            let (number, pages) = asked(base + 3 * PAGE, base + 4 * PAGE).expect("it stands still");
+            let noted = pages.iter().find(|n| n.0 == page(3)).map_or(0, |n| n.1);
+            assert!(noted > standing, "the note is newer than the asking, port 7: {port}");
+            assert!(number >= noted, "the standing number {number} is older than the note {noted}, port 7: {port}");
+            ask_once_end();
+        }
+        PORT_JOURNAL_IN_TEST.set(false);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
-        let page = (a + 3 * PAGE) / PAGE;
-        assert!(after.iter().any(|&(p, w)| p == page && w > asked), "our write is not in the journal: {after:?} (asked {asked})");
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
